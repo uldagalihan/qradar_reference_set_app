@@ -31,7 +31,7 @@ _TR_MAP = str.maketrans({
 
 def normalize_username(s: str) -> str:
     s = (s or "").strip()
-    s = re.sub(r"\\s+", " ", s)
+    s = re.sub(r"\s+", " ", s)
     s = s.translate(_TR_MAP).lower()
     try:
         import unicodedata
@@ -39,9 +39,9 @@ def normalize_username(s: str) -> str:
     except Exception:
         pass
     s = re.sub(r"[^a-z0-9 ]+", "", s)
-    s = re.sub(r"\\s+", " ", s).strip()
+    s = re.sub(r"\s+", " ", s).strip()
     s = s.replace(" ", ".")
-    s = re.sub(r"\\.+", ".", s).strip(".")
+    s = re.sub(r"\.+", ".", s).strip(".")
     return s
 
 def ensure_trailing_api(base: str) -> str:
@@ -239,10 +239,10 @@ class QRadarReferenceSetApp(AppBase):
             session  = requests.Session()
             headers  = make_headers(payload["sec_token"])
 
-            # 10k shard: base, base2, base3, ...
             inserts = 0
             set_names = []
 
+            # 10k shard: base, base2, base3, ...
             for i in range(0, len(variants), MAX_PER_SET):
                 part = variants[i:i+MAX_PER_SET]
                 set_name = payload["base_set_name"] if i == 0 else f"{payload['base_set_name']}{(i//MAX_PER_SET)+1}"

@@ -3,50 +3,23 @@
 
 import json
 import time
-import re
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 import requests
 import truststore
 from walkoff_app_sdk.app_base import AppBase
 
-# Use OS trust store (QRadar'ın iç CA'sı sisteme ekliyse işine yarar)
+# Sistem trust store (iç CA yüklüyse işine yarar)
 truststore.inject_into_ssl()
 
 # ==== Sabitler ====
-API_VERSION         = "21.0"
-VERIFY_SSL          = False            # Prod'da mümkünse True yap
-HTTP_TIMEOUT_SEC    = 60
-POLL_INTERVAL_SEC   = 1.0
-POLL_TIMEOUT_SEC    = 900
-MAX_HTTP_RETRIES    = 5
-BULK_BATCH_SIZE     = 1000
-MAX_PER_SET         = 10_000
-DEFAULT_TTL         = 15552000         # ~6 ay
-DEFAULT_ENTRY_TYPES = ["ALNIC", "ALN"] # Ortamına göre gerekirse tek tipe indir
+API_VERSION        = "21.0"
+VERIFY_SSL         = False             # Prod'da mümkünse True yap
+HTTP_TIMEOUT_SEC   = (5, 10)           # (connect, read) — kısa tut, cloud timeout yeme
+MAX_HTTP_RETRIES   = 5
+BULK_BATCH_SIZE    = 1000
+MAX_PER_SET        = 10_000
 
-_SURNAME_CONNECTORS = {"de","da","van","von","bin","ibn","al","el","oğlu","oglu","del","di"}
-
-_TR_MAP = str.maketrans({
-    "ç": "c", "ğ": "g", "ı": "i", "ö": "o", "ş": "s", "ü": "u",
-    "Ç": "c", "Ğ": "g", "İ": "i", "I": "i", "Ö": "o", "Ş": "s", "Ü": "u",
-})
-
-# ==== Yardımcılar: string/username ====
-
-def normalize_username(s: str) -> str:
-    s = (s or "").strip()
-    s = re.sub(r"\s+", " ", s)
-    s = s.translate(_TR_MAP).lower()
-    try:
-        import unicodedata
-        s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
-    except Exception:
-        pass
-    s = re.sub(r"[^a-z0-9 ]+", "", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    s = s.replace(" ", ".")
-    s = re.sub(r"\.+", ".", s).strip(".")
-    return s
+# ==== Yardımcılar ====
 
 def ensure_trailing_api(base: str) -> str:
     base = (base or "").rstrip("/")
@@ -61,8 +34,6 @@ def make_headers(sec_token: str) -> dict:
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
-
-# ==== HTTP (retry/backoff) ====
 
 def http_request(session: requests.Session, method: str, url: str, **kwargs) -> requests.Response:
     timeout = kwargs.pop("timeout", HTTP_TIMEOUT_SEC)
@@ -102,44 +73,43 @@ def find_set(session: requests.Session, base_url: str, set_name: str, headers: d
         return arr[0]
     return None
 
-def create_set(session, base_url, set_name, headers, expiry_type="FIRST_SEEN", ttl=DEFAULT_TTL, entry_types=None):
+def create_set(session, base_url, set_name, headers, entry_type="ALNIC", expiry_type="NO_EXPIRY"):
+    """
+    Basit kurulum: NO_EXPIRY set yarat (TTL yok). entry_type: ALNIC/ALN/...
+    Set varsa ID'sini döndürür.
+    """
+    # Önce var mı bak
+    existing = find_set(session, base_url, set_name, headers)
+    if existing and "id" in existing:
+        return existing["id"]
+
     url = f"{base_url}/reference_data_collections/sets"
-    last_err = None
-    if not entry_types:
-        entry_types = DEFAULT_ENTRY_TYPES
+    body = {
+        "name": set_name,
+        "entry_type": entry_type,
+        "expiry_type": expiry_type,   # NO_EXPIRY -> TTL yok
+    }
+    r = http_request(session, "POST", url, headers=headers, json=body, verify=VERIFY_SSL)
+    if r.status_code == 201:
+        return r.json()["id"]
+    if r.status_code == 409:
+        existing = find_set(session, base_url, set_name, headers)
+        if existing and "id" in existing:
+            return existing["id"]
+        raise SystemExit(f"409 ama ID bulunamadı: {set_name} -> {r.text}")
+    raise SystemExit(f"Set oluşturulamadı: {set_name}  HTTP {r.status_code}: {r.text}")
 
-    for et in entry_types:
-        body = {
-            "name": set_name,
-            "entry_type": et,
-            "expiry_type": expiry_type,
-            "time_to_live": ttl,
-        }
-        r = http_request(session, "POST", url, headers=headers, json=body, verify=VERIFY_SSL)
-        if r.status_code == 201:
-            return r.json()["id"]
-        if r.status_code == 409:
-            existing = find_set(session, base_url, set_name, headers)
-            if existing and "id" in existing:
-                return existing["id"]
-            raise SystemExit(f"409 ama ID bulunamadı: {set_name} -> {r.text}")
-        if r.status_code == 400:
-            # Başka entry_type ile tekrar dene
-            last_err = f"400 {r.text}"
-            continue
-        raise SystemExit(f"Set oluşturulamadı: {set_name}  HTTP {r.status_code}: {r.text}")
+# ==== Bulk insert (polling opsiyonel) ====
 
-    raise SystemExit(f"Set oluşturma başarısız: {set_name}  Son hata: {last_err}")
-
-# ==== Bulk ekleme + task poll ====
-
-def bulk_add_values(session, base_url, collection_id: int, values, headers, source_label="shuffle_qradar_loader"):
+def bulk_add_values(session, base_url, collection_id: int, values, headers,
+                    source_label="shuffle_qradar_loader", wait_for_completion=False):
     patch_url  = f"{base_url}/reference_data_collections/set_entries"
     status_url = f"{base_url}/reference_data_collections/set_bulk_update_tasks/{{task_id}}"
 
     seen = set()
-    values = [v for v in values if v and not (v in seen or seen.add(v))]
+    values = [v for v in values if isinstance(v, str) and (v := v.strip()) and not (v in seen or seen.add(v))]
 
+    task_ids = []
     for i in range(0, len(values), BULK_BATCH_SIZE):
         batch = values[i:i+BULK_BATCH_SIZE]
         payload = [{"collection_id": collection_id, "value": v, "source": source_label} for v in batch]
@@ -149,8 +119,14 @@ def bulk_add_values(session, base_url, collection_id: int, values, headers, sour
         task_id = (r.json() or {}).get("id")
         if not task_id:
             raise SystemExit(f"Bulk task id dönmedi: {r.text}")
+        task_ids.append(task_id)
 
-        start = time.time()
+    if not wait_for_completion:
+        return {"task_ids": task_ids, "completed": False}
+
+    # (İsteğe bağlı) poll et
+    start = time.time()
+    for task_id in task_ids:
         while True:
             sr = http_request(session, "GET", status_url.format(task_id=task_id), headers=headers, verify=VERIFY_SSL)
             if sr.status_code != 200:
@@ -161,46 +137,19 @@ def bulk_add_values(session, base_url, collection_id: int, values, headers, sour
                 break
             if status in ("EXCEPTION", "CONFLICT", "CANCELLED", "INTERRUPTED"):
                 raise SystemExit(f"Bulk task hata: {status}  Detay: {json.dumps(sjson)[:400]}")
-            if time.time() - start > POLL_TIMEOUT_SEC:
-                raise SystemExit(f"Bulk task timeout ({POLL_TIMEOUT_SEC}s). Son: {json.dumps(sjson)[:400]}")
-            time.sleep(POLL_INTERVAL_SEC)
+            if time.time() - start > 600:  # güvenli üst sınır
+                raise SystemExit(f"Bulk task timeout. Son: {json.dumps(sjson)[:400]}")
+            time.sleep(1.0)
 
-# ==== İsim -> kullanıcı adı varyantları ====
+    return {"task_ids": task_ids, "completed": True}
 
-def split_name_tokens(full_name: str):
-    toks = re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü'’-]+", full_name or "")
-    return toks
-
-def detect_surname_tokens(tokens):
-    if not tokens:
-        return [], []
-    if len(tokens) >= 2 and tokens[-2].lower() in _SURNAME_CONNECTORS:
-        return tokens[:-2], tokens[-2:]
-    return tokens[:-1], [tokens[-1]]
-
-def name_variants(full_name: str):
-    toks = split_name_tokens(full_name)
-    if len(toks) < 2:
-        return []
-    given, surname = detect_surname_tokens(toks)
-    if not given or not surname:
-        return []
-    surname_str = " ".join(surname)
-    out = []
-    for g in given:
-        u = normalize_username(f"{g} {surname_str}")
-        if u:
-            out.append(u)
-    seen = set()
-    return [v for v in out if not (v in seen or seen.add(v))]
-
-# ==== NEW: Her türlü payload'ı yut, isimleri çıkar ====
+# ==== Payload parse (sade) ====
 
 def _parse_any_payload(maybe_json):
     """
-    - dict ya da str(JSON) alır; {"names":[...]} ve/veya {"items":[{"name":...}]} arar.
-    - Liste geldiyse ["Ad Soyad", ...] kabul eder.
-    - Zor durumda, anahtar isminde 'name' geçen listeleri de dener.
+    Beklenenler:
+      - names: ["Ad Soyad", ...]
+      - items: [{"name": "Ad Soyad"}, ...]
     """
     data = maybe_json
     if isinstance(maybe_json, str):
@@ -214,30 +163,17 @@ def _parse_any_payload(maybe_json):
     names = list(data.get("names") or [])
     items = list(data.get("items") or [])
 
-    # items -> name/full_name/fullname
     item_names = []
     for it in items:
         if isinstance(it, dict):
-            nm = it.get("name") or it.get("full_name") or it.get("fullname") or ""
-            if isinstance(nm, str) and nm.strip():
-                item_names.append(nm.strip())
-        elif isinstance(it, str) and it.strip():
-            item_names.append(it.strip())
+            nm = (it.get("name") or "").strip()
+            if nm:
+                item_names.append(nm)
+        elif isinstance(it, str):
+            s = it.strip()
+            if s:
+                item_names.append(s)
 
-    # Dış payload doğrudan liste ise
-    if not names and isinstance(maybe_json, (list, tuple)):
-        names = [x for x in maybe_json if isinstance(x, str)]
-
-    # Son çare: anahtar isminde 'name' geçen listeler
-    if not names and not item_names:
-        try:
-            for k, v in data.items():
-                if isinstance(v, list) and "name" in k.lower():
-                    names.extend([x for x in v if isinstance(x, str)])
-        except Exception:
-            pass
-
-    # Birleştir & dedup
     all_names = []
     seen = set()
     for n in (names + item_names):
@@ -245,125 +181,86 @@ def _parse_any_payload(maybe_json):
         if s and s not in seen:
             seen.add(s)
             all_names.append(s)
-    return {"names": all_names, "items": items}
+    return all_names
 
-# ==== UPDATED: varyant üretici (items + names toleranslı) ====
-
-def expand_from_items_or_names(payload: dict):
-    variants = []
-    items = payload.get("items") or []
-    names = payload.get("names") or []
-
-    # items -> it["name"] / string
-    if isinstance(items, list):
-        for it in items:
-            if isinstance(it, dict):
-                nm = (it or {}).get("name") or (it or {}).get("full_name") or (it or {}).get("fullname") or ""
-                variants.extend(name_variants(nm))
-            elif isinstance(it, str):
-                variants.extend(name_variants(it))
-
-    # names -> str list
-    if isinstance(names, list):
-        for nm in names:
-            variants.extend(name_variants(nm))
-
-    # dedup
-    seen = set()
-    return [v for v in variants if v and not (v in seen or seen.add(v))]
-
-# ==== Ana App ====
+# ==== App ====
 
 class QRadarReferenceSetApp(AppBase):
-    __version__ = "1.0.1"  # Güncellendi
-    app_name   = "QRadar Reference Set Loader"
+    __version__ = "2.0.0"
+    app_name   = "QRadar Reference Set Loader (No-Expiry, Name-only)"
 
     def __init__(self, redis=None, logger=None, **kwargs):
         super().__init__(redis=redis, logger=logger, **kwargs)
 
-    def upsert_from_payload(self, base_url, sec_token, base_set_name="istenCikanlar",
-                            expiry_type="FIRST_SEEN", time_to_live=DEFAULT_TTL, entry_types=None,
-                            items=None, names=None,
-                            raw_payload=None,                   # ← yeni: önceki adımın çıktısını aynen ver
-                            insert_full_names_if_empty=True     # ← yeni: varyant yoksa tam ad ekle
-                            ):
+    def upsert_names(self,
+                     base_url,
+                     sec_token,
+                     set_name="istenCikanlar",
+                     entry_type="ALNIC",
+                     names=None,
+                     items=None,
+                     raw_payload=None,
+                     wait_for_completion=False):
         """
-        Shuffle action:
-        - base_url: "https://<qradar>/api" ("/api" yoksa eklenir)
-        - sec_token: QRadar SEC token
-        - base_set_name: default "istenCikanlar"
-        - expiry_type: FIRST_SEEN | LAST_SEEN | NO_EXPIRY
-        - time_to_live: seconds (default 6 months)
-        - entry_types: ["ALNIC","ALN"] order
-        - items: Outlook JSON list (optional)
-        - names: list of full names (optional)
-        - raw_payload: str|dict -> Önceki step'in JSON çıktısını aynen yapıştır (opsiyonel)
-        - insert_full_names_if_empty: True -> varyant yoksa tam adları value olarak kullan
+        Basitleştirilmiş Shuffle action:
+        - Set NO_EXPIRY oluşturulur/varsa kullanılır.
+        - Sadece 'name' string’leri eklenir (değer = isim).
+        - entry_type: set tipi (ALNIC/ALN/NUM/IP/PORT/DATE)
+        - wait_for_completion: True ise bulk task tamamlanana kadar bekler (on-prem).
         """
-        # 0) raw_payload geldiyse parse et ve items/names ile birleştir
-        parsed = _parse_any_payload(raw_payload) if raw_payload is not None else {"names":[], "items":[]}
-        merged_names = (names or []) + parsed.get("names", [])
-        merged_items = (items or []) + parsed.get("items", [])
+        base_url = ensure_trailing_api(base_url)
+        session  = requests.Session()
+        headers  = make_headers(sec_token)
 
-        payload = {
-            "base_url": ensure_trailing_api(base_url),
-            "sec_token": sec_token,
-            "base_set_name": base_set_name or "istenCikanlar",
-            "expiry_type": expiry_type or "FIRST_SEEN",
-            "time_to_live": int(time_to_live) if time_to_live is not None else DEFAULT_TTL,
-            "entry_types": entry_types or DEFAULT_ENTRY_TYPES,
-            "items": merged_items,
-            "names": merged_names,
-        }
+        # 1) İsimleri derle
+        merged = []
+        if names:
+            merged.extend([n for n in names if isinstance(n, str)])
+        if items:
+            for it in items:
+                if isinstance(it, dict) and it.get("name"):
+                    merged.append(it["name"])
+                elif isinstance(it, str):
+                    merged.append(it)
+        if raw_payload is not None:
+            merged.extend(_parse_any_payload(raw_payload))
 
-        try:
-            # 1) Username varyantları (g.soyad vb.)
-            variants = expand_from_items_or_names(payload)
-            if self.logger:
-                self.logger.info(f"[QRadarLoader] variants(from usernames)={len(variants)}; names_in={len(merged_names)} items_in={len(merged_items)}")
+        # Temizle / dedup
+        vals = []
+        seen = set()
+        for v in merged:
+            s = (v or "").strip()
+            if s and s not in seen:
+                seen.add(s)
+                vals.append(s)
 
-            # 2) Hiç varyant yoksa (tokenizasyon tutmadı vs.) — opsiyonel fallback: tam adları value olarak ekle
-            fallback_values = []
-            if not variants and insert_full_names_if_empty:
-                fallback_values = [s for s in merged_names if isinstance(s, str) and s.strip()]
-                if self.logger:
-                    self.logger.info(f"[QRadarLoader] username variants empty -> using full names fallback: {len(fallback_values)}")
+        if self.logger:
+            self.logger.info(f"[QRadarLoader] prepared name values: {len(vals)}")
 
-            values = variants or fallback_values
-            if not values:
-                return {
-                    "success": True,
-                    "inserted": 0,
-                    "set_names": [],
-                    "message": "No values to insert. (names/items empty or could not produce variants)"
-                }
+        if not vals:
+            return {"success": True, "inserted": 0, "set_names": [], "task_ids": [],
+                    "message": "No values to insert."}
 
-            session  = requests.Session()
-            headers  = make_headers(payload["sec_token"])
+        # 2) Set hazırla (NO_EXPIRY)
+        set_names = []
+        task_ids_all = []
+        inserts = 0
 
-            inserts = 0
-            set_names = []
+        # 10k shard (gerekirse): set, set2, set3...
+        for i in range(0, len(vals), MAX_PER_SET):
+            part = vals[i:i+MAX_PER_SET]
+            this_set = set_name if i == 0 else f"{set_name}{(i//MAX_PER_SET)+1}"
+            set_id = create_set(session, base_url, this_set, headers,
+                                entry_type=entry_type, expiry_type="NO_EXPIRY")
+            set_names.append(this_set)
 
-            # 10k shard: base, base2, base3, ...
-            for i in range(0, len(values), MAX_PER_SET):
-                part = values[i:i+MAX_PER_SET]
-                set_name = payload["base_set_name"] if i == 0 else f"{payload['base_set_name']}{(i//MAX_PER_SET)+1}"
-                set_names.append(set_name)
+            res = bulk_add_values(session, base_url, set_id, part, headers=headers,
+                                  wait_for_completion=wait_for_completion)
+            task_ids_all.extend(res.get("task_ids", []))
+            inserts += len(part)
 
-                set_id = create_set(session, payload["base_url"], set_name, headers,
-                                    expiry_type=payload["expiry_type"],
-                                    ttl=payload["time_to_live"],
-                                    entry_types=payload["entry_types"])
-
-                bulk_add_values(session, payload["base_url"], set_id, part, headers=headers)
-                inserts += len(part)
-
-            return {"success": True, "inserted": inserts, "set_names": set_names, "message": "OK"}
-
-        except Exception as e:
-            if self.logger:
-                self.logger.exception("QRadar upsert_from_payload failed")
-            return {"success": False, "inserted": 0, "set_names": [], "message": str(e)}
+        return {"success": True, "inserted": inserts, "set_names": set_names,
+                "task_ids": task_ids_all, "message": "OK"}
 
 # ==== CLI/Runner ====
 

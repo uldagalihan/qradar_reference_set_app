@@ -1,0 +1,74 @@
+﻿name: QRadar Reference Set Loader
+description: Load usernames into QRadar Reference Sets from Outlook/Shuffle JSON (supports multi-given-name variants and 6-month TTL)
+app_version: "1.0.0"
+contact_info:
+  name: "uldagalihan"
+  url: "https://github.com/uldagalihan/qradar_reference_set_app"
+  email: "example@example.com"
+categories:
+  - SIEM
+  - Security
+authentication: {}
+actions:
+  - name: upsert_from_payload
+    label: Upsert Reference Set from JSON (items/names)
+    description: >
+      Accepts 'items' (from Outlook action) or 'names' (array of full names),
+      generates username variants (e.g., "Alihan Emre Uludağ" -> "alihan.uludag","emre.uludag"),
+      creates/uses a QRadar Reference Set with FIRST_SEEN + TTL (default 6 months), then bulk adds entries.
+    parameters:
+      - name: base_url
+        required: true
+        schema: { type: string, description: "QRadar base URL (with or without /api)" }
+      - name: sec_token
+        required: true
+        variant: STATIC_VALUE
+        configuration: true
+        schema: { type: string, description: "QRadar SEC token" }
+      - name: base_set_name
+        required: false
+        schema: { type: string, default: "istenCikanlar", description: "Reference set base name" }
+      - name: expiry_type
+        required: false
+        schema: { type: string, default: "FIRST_SEEN", enum: ["FIRST_SEEN","LAST_SEEN","NO_EXPIRY"] }
+      - name: time_to_live
+        required: false
+        schema: { type: integer, default: 15552000, description: "TTL seconds (default ~6 months)" }
+      - name: entry_types
+        required: false
+        schema:
+          type: array
+          items: { type: string }
+          default: ["ALNIC","ALN"]
+          description: "Preferred entry_type order"
+      - name: items
+        required: false
+        schema:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              mail_received_at: { type: string }
+              termination_date: { type: string }
+              activate_at: { type: string }
+              subject: { type: string }
+              message_id: { type: string }
+              preview: { type: string }
+        description: "Directly pass .items"
+      - name: names
+        required: false
+        schema:
+          type: array
+          items: { type: string }
+        description: "Alternative input: raw full names"
+    returns:
+      schema:
+        type: object
+        properties:
+          success: { type: boolean }
+          inserted: { type: integer }
+          set_names:
+            type: array
+            items: { type: string }
+          message: { type: string }

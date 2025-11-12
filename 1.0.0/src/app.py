@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import json
@@ -9,18 +9,20 @@ import requests
 import truststore
 from walkoff_app_sdk.app_base import AppBase
 
-truststore.inject_into_ssl()   # use OS trust store
+# Use OS trust store (QRadar'ın iç CA'sı sisteme ekliyse işine yarar)
+truststore.inject_into_ssl()
 
-API_VERSION       = "21.0"
-VERIFY_SSL        = False
-HTTP_TIMEOUT_SEC  = 60
-POLL_INTERVAL_SEC = 1.0
-POLL_TIMEOUT_SEC  = 900
-MAX_HTTP_RETRIES  = 5
-BULK_BATCH_SIZE   = 1000
-MAX_PER_SET       = 10_000
-DEFAULT_TTL       = 15552000   # ~6 months
-DEFAULT_ENTRY_TYPES = ["ALNIC", "ALN"]
+# ==== Sabitler ====
+API_VERSION         = "21.0"
+VERIFY_SSL          = False            # Prod'da mümkünse True yap
+HTTP_TIMEOUT_SEC    = 60
+POLL_INTERVAL_SEC   = 1.0
+POLL_TIMEOUT_SEC    = 900
+MAX_HTTP_RETRIES    = 5
+BULK_BATCH_SIZE     = 1000
+MAX_PER_SET         = 10_000
+DEFAULT_TTL         = 15552000         # ~6 ay
+DEFAULT_ENTRY_TYPES = ["ALNIC", "ALN"] # Ortamına göre gerekirse tek tipe indir
 
 _SURNAME_CONNECTORS = {"de","da","van","von","bin","ibn","al","el","oğlu","oglu","del","di"}
 
@@ -28,6 +30,8 @@ _TR_MAP = str.maketrans({
     "ç": "c", "ğ": "g", "ı": "i", "ö": "o", "ş": "s", "ü": "u",
     "Ç": "c", "Ğ": "g", "İ": "i", "I": "i", "Ö": "o", "Ş": "s", "Ü": "u",
 })
+
+# ==== Yardımcılar: string/username ====
 
 def normalize_username(s: str) -> str:
     s = (s or "").strip()
@@ -58,6 +62,8 @@ def make_headers(sec_token: str) -> dict:
         "Content-Type": "application/json",
     }
 
+# ==== HTTP (retry/backoff) ====
+
 def http_request(session: requests.Session, method: str, url: str, **kwargs) -> requests.Response:
     timeout = kwargs.pop("timeout", HTTP_TIMEOUT_SEC)
     for attempt in range(1, MAX_HTTP_RETRIES + 1):
@@ -82,6 +88,8 @@ def http_request(session: requests.Session, method: str, url: str, **kwargs) -> 
 
         return resp
     return resp
+
+# ==== Reference Set keşif/oluşturma ====
 
 def find_set(session: requests.Session, base_url: str, set_name: str, headers: dict):
     filt = "name='%s'" % set_name
@@ -116,11 +124,14 @@ def create_set(session, base_url, set_name, headers, expiry_type="FIRST_SEEN", t
                 return existing["id"]
             raise SystemExit(f"409 ama ID bulunamadı: {set_name} -> {r.text}")
         if r.status_code == 400:
+            # Başka entry_type ile tekrar dene
             last_err = f"400 {r.text}"
             continue
         raise SystemExit(f"Set oluşturulamadı: {set_name}  HTTP {r.status_code}: {r.text}")
 
     raise SystemExit(f"Set oluşturma başarısız: {set_name}  Son hata: {last_err}")
+
+# ==== Bulk ekleme + task poll ====
 
 def bulk_add_values(session, base_url, collection_id: int, values, headers, source_label="shuffle_qradar_loader"):
     patch_url  = f"{base_url}/reference_data_collections/set_entries"
@@ -154,6 +165,8 @@ def bulk_add_values(session, base_url, collection_id: int, values, headers, sour
                 raise SystemExit(f"Bulk task timeout ({POLL_TIMEOUT_SEC}s). Son: {json.dumps(sjson)[:400]}")
             time.sleep(POLL_INTERVAL_SEC)
 
+# ==== İsim -> kullanıcı adı varyantları ====
+
 def split_name_tokens(full_name: str):
     toks = re.findall(r"[A-Za-zÇĞİÖŞÜçğıöşü'’-]+", full_name or "")
     return toks
@@ -181,22 +194,88 @@ def name_variants(full_name: str):
     seen = set()
     return [v for v in out if not (v in seen or seen.add(v))]
 
+# ==== NEW: Her türlü payload'ı yut, isimleri çıkar ====
+
+def _parse_any_payload(maybe_json):
+    """
+    - dict ya da str(JSON) alır; {"names":[...]} ve/veya {"items":[{"name":...}]} arar.
+    - Liste geldiyse ["Ad Soyad", ...] kabul eder.
+    - Zor durumda, anahtar isminde 'name' geçen listeleri de dener.
+    """
+    data = maybe_json
+    if isinstance(maybe_json, str):
+        try:
+            data = json.loads(maybe_json)
+        except Exception:
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+
+    names = list(data.get("names") or [])
+    items = list(data.get("items") or [])
+
+    # items -> name/full_name/fullname
+    item_names = []
+    for it in items:
+        if isinstance(it, dict):
+            nm = it.get("name") or it.get("full_name") or it.get("fullname") or ""
+            if isinstance(nm, str) and nm.strip():
+                item_names.append(nm.strip())
+        elif isinstance(it, str) and it.strip():
+            item_names.append(it.strip())
+
+    # Dış payload doğrudan liste ise
+    if not names and isinstance(maybe_json, (list, tuple)):
+        names = [x for x in maybe_json if isinstance(x, str)]
+
+    # Son çare: anahtar isminde 'name' geçen listeler
+    if not names and not item_names:
+        try:
+            for k, v in data.items():
+                if isinstance(v, list) and "name" in k.lower():
+                    names.extend([x for x in v if isinstance(x, str)])
+        except Exception:
+            pass
+
+    # Birleştir & dedup
+    all_names = []
+    seen = set()
+    for n in (names + item_names):
+        s = (n or "").strip()
+        if s and s not in seen:
+            seen.add(s)
+            all_names.append(s)
+    return {"names": all_names, "items": items}
+
+# ==== UPDATED: varyant üretici (items + names toleranslı) ====
+
 def expand_from_items_or_names(payload: dict):
     variants = []
     items = payload.get("items") or []
     names = payload.get("names") or []
+
+    # items -> it["name"] / string
     if isinstance(items, list):
         for it in items:
-            nm = (it or {}).get("name") or ""
-            variants.extend(name_variants(nm))
+            if isinstance(it, dict):
+                nm = (it or {}).get("name") or (it or {}).get("full_name") or (it or {}).get("fullname") or ""
+                variants.extend(name_variants(nm))
+            elif isinstance(it, str):
+                variants.extend(name_variants(it))
+
+    # names -> str list
     if isinstance(names, list):
         for nm in names:
             variants.extend(name_variants(nm))
+
+    # dedup
     seen = set()
     return [v for v in variants if v and not (v in seen or seen.add(v))]
 
+# ==== Ana App ====
+
 class QRadarReferenceSetApp(AppBase):
-    __version__ = "1.0.0"
+    __version__ = "1.0.1"  # Güncellendi
     app_name   = "QRadar Reference Set Loader"
 
     def __init__(self, redis=None, logger=None, **kwargs):
@@ -204,7 +283,10 @@ class QRadarReferenceSetApp(AppBase):
 
     def upsert_from_payload(self, base_url, sec_token, base_set_name="istenCikanlar",
                             expiry_type="FIRST_SEEN", time_to_live=DEFAULT_TTL, entry_types=None,
-                            items=None, names=None):
+                            items=None, names=None,
+                            raw_payload=None,                   # ← yeni: önceki adımın çıktısını aynen ver
+                            insert_full_names_if_empty=True     # ← yeni: varyant yoksa tam ad ekle
+                            ):
         """
         Shuffle action:
         - base_url: "https://<qradar>/api" ("/api" yoksa eklenir)
@@ -215,27 +297,47 @@ class QRadarReferenceSetApp(AppBase):
         - entry_types: ["ALNIC","ALN"] order
         - items: Outlook JSON list (optional)
         - names: list of full names (optional)
+        - raw_payload: str|dict -> Önceki step'in JSON çıktısını aynen yapıştır (opsiyonel)
+        - insert_full_names_if_empty: True -> varyant yoksa tam adları value olarak kullan
         """
+        # 0) raw_payload geldiyse parse et ve items/names ile birleştir
+        parsed = _parse_any_payload(raw_payload) if raw_payload is not None else {"names":[], "items":[]}
+        merged_names = (names or []) + parsed.get("names", [])
+        merged_items = (items or []) + parsed.get("items", [])
+
         payload = {
-            "base_url": base_url,
+            "base_url": ensure_trailing_api(base_url),
             "sec_token": sec_token,
             "base_set_name": base_set_name or "istenCikanlar",
             "expiry_type": expiry_type or "FIRST_SEEN",
             "time_to_live": int(time_to_live) if time_to_live is not None else DEFAULT_TTL,
             "entry_types": entry_types or DEFAULT_ENTRY_TYPES,
-            "items": items or [],
-            "names": names or [],
+            "items": merged_items,
+            "names": merged_names,
         }
 
         try:
+            # 1) Username varyantları (g.soyad vb.)
             variants = expand_from_items_or_names(payload)
             if self.logger:
-                self.logger.info(f"[QRadarLoader] variants={len(variants)}")
+                self.logger.info(f"[QRadarLoader] variants(from usernames)={len(variants)}; names_in={len(merged_names)} items_in={len(merged_items)}")
 
-            if not variants:
-                return {"success": True, "inserted": 0, "set_names": [], "message": "No values to insert."}
+            # 2) Hiç varyant yoksa (tokenizasyon tutmadı vs.) — opsiyonel fallback: tam adları value olarak ekle
+            fallback_values = []
+            if not variants and insert_full_names_if_empty:
+                fallback_values = [s for s in merged_names if isinstance(s, str) and s.strip()]
+                if self.logger:
+                    self.logger.info(f"[QRadarLoader] username variants empty -> using full names fallback: {len(fallback_values)}")
 
-            base_url = ensure_trailing_api(payload["base_url"])
+            values = variants or fallback_values
+            if not values:
+                return {
+                    "success": True,
+                    "inserted": 0,
+                    "set_names": [],
+                    "message": "No values to insert. (names/items empty or could not produce variants)"
+                }
+
             session  = requests.Session()
             headers  = make_headers(payload["sec_token"])
 
@@ -243,17 +345,17 @@ class QRadarReferenceSetApp(AppBase):
             set_names = []
 
             # 10k shard: base, base2, base3, ...
-            for i in range(0, len(variants), MAX_PER_SET):
-                part = variants[i:i+MAX_PER_SET]
+            for i in range(0, len(values), MAX_PER_SET):
+                part = values[i:i+MAX_PER_SET]
                 set_name = payload["base_set_name"] if i == 0 else f"{payload['base_set_name']}{(i//MAX_PER_SET)+1}"
                 set_names.append(set_name)
 
-                set_id = create_set(session, base_url, set_name, headers,
+                set_id = create_set(session, payload["base_url"], set_name, headers,
                                     expiry_type=payload["expiry_type"],
                                     ttl=payload["time_to_live"],
                                     entry_types=payload["entry_types"])
 
-                bulk_add_values(session, base_url, set_id, part, headers=headers)
+                bulk_add_values(session, payload["base_url"], set_id, part, headers=headers)
                 inserts += len(part)
 
             return {"success": True, "inserted": inserts, "set_names": set_names, "message": "OK"}
@@ -262,6 +364,8 @@ class QRadarReferenceSetApp(AppBase):
             if self.logger:
                 self.logger.exception("QRadar upsert_from_payload failed")
             return {"success": False, "inserted": 0, "set_names": [], "message": str(e)}
+
+# ==== CLI/Runner ====
 
 if __name__ == "__main__":
     QRadarReferenceSetApp.run()

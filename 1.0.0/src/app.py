@@ -35,6 +35,20 @@ def normalize_username(s: str) -> str:
     s = s.replace(" ", ".").strip(".")
     return re.sub(r"\.+", ".", s)
 
+
+def parse_excluded_persons(persons_str: Optional[str]) -> set:
+    """
+    "cabbar.uludag, Emre Uludağ" gibi girilenleri normalize edip set döndürür.
+    """
+    if not persons_str:
+        return set()
+    parts = re.split(r"[,\n;]+", persons_str)
+    out = set()
+    for p in parts:
+        key = normalize_username(p)
+        if key:
+            out.add(key)
+    return out
 def ensure_trailing_api(base: str) -> str:
     base = (base or "").rstrip("/")
     return base if base.endswith("/api") else base + "/api"
@@ -161,7 +175,7 @@ def expand_from_items_or_names(payload):
     return _dedup_keep_order(variants)
 
 class QRadarReferenceSetApp(AppBase):
-    __version__ = "1.1.3"
+    __version__ = "1.1.4"
     app_name = "QRadar Reference Set Loader"
 
     def __init__(self, redis=None, logger=None, **kwargs):
@@ -174,6 +188,8 @@ class QRadarReferenceSetApp(AppBase):
         items=None, names=None,
         raw_payload=None,
         insert_full_names_if_empty=True
+    ,
+        exclude_persons=None
     ):
         parsed = _parse_any_payload(raw_payload) if raw_payload else {"names": [], "items": []}
         merged_names = list(names or []) + parsed.get("names", [])
@@ -188,6 +204,9 @@ class QRadarReferenceSetApp(AppBase):
         }
         try:
             variants = expand_from_items_or_names(payload)
+            excluded = parse_excluded_persons(exclude_persons)
+            if excluded:
+                variants = [v for v in variants if v not in excluded]
             if not variants and insert_full_names_if_empty:
                 variants = [n for n in merged_names if n.strip()]
             if not variants:
@@ -208,4 +227,5 @@ class QRadarReferenceSetApp(AppBase):
 
 if __name__ == "__main__":
     QRadarReferenceSetApp.run()
+
 

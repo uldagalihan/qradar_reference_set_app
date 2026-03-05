@@ -9,6 +9,7 @@ RUN python -m pip install --upgrade pip && pip install --no-cache-dir --prefix="
 
 FROM base
 COPY --from=builder /install /usr/local
-COPY src /app
+COPY src/app.py /app/app.py
 WORKDIR /app
 CMD python app.py --log-level DEBUG
+

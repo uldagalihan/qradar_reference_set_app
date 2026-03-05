@@ -1,6 +1,6 @@
 ﻿name: QRadar Reference Set Loader
 description: Load usernames into QRadar Reference Sets from Outlook/Shuffle JSON (supports multi-given-name variants and 6-month TTL)
-app_version: "1.1.6"
+app_version: "1.1.7"
 contact_info:
   name: "uldagalihan"
   url: "https://github.com/uldagalihan/qradar_reference_set_app"
@@ -77,6 +77,7 @@ actions:
             type: array
             items: { type: string }
           message: { type: string }
+
 
 
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
@@ -161,7 +161,7 @@ def expand_from_items_or_names(payload):
     return _dedup_keep_order(variants)
 
 class QRadarReferenceSetApp(AppBase):
-    __version__ = "1.0.1"
+    __version__ = "1.1.3"
     app_name = "QRadar Reference Set Loader"
 
     def __init__(self, redis=None, logger=None, **kwargs):
@@ -208,3 +208,4 @@ class QRadarReferenceSetApp(AppBase):
 
 if __name__ == "__main__":
     QRadarReferenceSetApp.run()
+
